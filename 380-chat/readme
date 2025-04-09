@@ -1,0 +1,3 @@
+cd "/home/christopher/Documents/Computer Security Labs/Lab 1/Computer-Security-Lab-1/380-chat" <--- Change this directory to your directory when running program
+Command to run chat program in terminal: ./chat -l & sleep 1 && ./chat -c localhost &
+ I also made a small edit to the make file to include crypto.

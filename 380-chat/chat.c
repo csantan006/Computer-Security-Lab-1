@@ -6,9 +6,12 @@
 #include <openssl/sha.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
+#include <openssl/rsa.h>
+#include <openssl/pem.h>
 #include <getopt.h>
 #include "dh.h"
 #include "keys.h"
+#include "crypto.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 1024
@@ -18,6 +21,7 @@ static GtkTextBuffer* tbuf; /* transcript buffer */
 static GtkTextBuffer* mbuf; /* message buffer */
 static GtkTextView*  tview; /* view for transcript */
 static GtkTextMark*   mark; /* used for scrolling to end of transcript, etc */
+unsigned char session_key[SHA256_DIGEST_LENGTH];
 
 static pthread_t trecv;     /* wait for incoming messagess and post to queue */
 void* recvMsg(void*);       /* for trecv */
@@ -154,8 +158,26 @@ static void sendMessage(GtkWidget* w /* <-- msg entry widget */, gpointer /* dat
 	size_t len = g_utf8_strlen(message,-1);
 	/* XXX we should probably do the actual network stuff in a different
 	 * thread and have it call this once the message is actually sent. */
+
+	// Encrypt the message
+    unsigned char iv[AES_IVLEN];  // IV for encryption
+    unsigned char ciphertext[1024];  // Buffer for the encrypted message
+    int ciphertext_len = encrypt_message((unsigned char*)message, len, session_key, iv, ciphertext);
+
+	// Display the encrypted message in hex
+    printf("Encrypted Message (Hex): ");
+    for (int i = 0; i < ciphertext_len; i++) {
+        printf("%02x", ciphertext[i]);
+    }
+    printf("\n");
+
+    // Combine IV and ciphertext into one buffer for sending
+    unsigned char outbuf[AES_IVLEN + ciphertext_len];
+    memcpy(outbuf, iv, AES_IVLEN);
+    memcpy(outbuf + AES_IVLEN, ciphertext, ciphertext_len);
+
 	ssize_t nbytes;
-	if ((nbytes = send(sockfd,message,len,0)) == -1)
+	if ((nbytes = send(sockfd, outbuf, AES_IVLEN + ciphertext_len, 0)) == -1)
 		error("send failed");
 
 	tsappend(message,NULL,1);
@@ -227,6 +249,105 @@ int main(int argc, char *argv[])
 		initServerNet(port);
 	}
 
+	// === Diffie-Hellman Exchange protocol ===
+
+	init("params"); // or initFromScratch(...) but the params are located in the params file for key generation
+
+	// Allocate public key buffers based on pLen
+	uint8_t* public_key_buf = malloc(pLen);
+	uint8_t* their_public_key_buf = malloc(pLen);
+	uint8_t local_session_key[SHA256_DIGEST_LENGTH];
+
+	// Initialize big numbers
+	mpz_t sk, pk, their_pk;
+	mpz_inits(sk, pk, their_pk, NULL);
+	/*
+	gmp_printf("Private Key: %Zd\n", sk); // Keys before they are generated should be 0. (debugging)
+	gmp_printf("Public Key: %Zd\n", pk); 
+	*/
+
+	// Generate the DH keys
+	dhGen(sk, pk);
+	
+	gmp_printf("Private Key: %Zd\n", sk); // After generation (debugging)
+	gmp_printf("Public Key: %Zd\n", pk);
+	
+
+	// Export our public key to the byte buffer (I had to look up the functions to do this.)
+	size_t count;
+	mpz_export(public_key_buf, &count, 1, 1, 0, 0, pk);
+
+	// Send public key
+	if (send(sockfd, public_key_buf, pLen, 0) == -1) {
+		perror("Failed to send public key");
+		exit(EXIT_FAILURE);
+	}
+
+	// Receive peer's public key
+	if (recv(sockfd, their_public_key_buf, pLen, MSG_WAITALL) == -1) {
+		perror("Failed to receive public key");
+		exit(EXIT_FAILURE);
+	}
+
+	// Import received public key into mpz_t
+	mpz_import(their_pk, pLen, 1, 1, 0, 0, their_public_key_buf);
+
+	// Get the shared session key
+	dhFinal(sk, pk, their_pk, local_session_key, sizeof(local_session_key));
+
+	// Copy to global session key to access for later
+	memcpy(session_key, local_session_key, SHA256_DIGEST_LENGTH);
+
+	// Print session keys to make sure they match for both processes
+	fprintf(stderr, "Session key: ");
+	for (int i = 0; i < SHA256_DIGEST_LENGTH; ++i) {
+		fprintf(stderr, "%02x", local_session_key[i]);
+	}
+	fprintf(stderr, "\n");
+
+	// Cleanup and freeing the memory of pointers and values
+	free(public_key_buf);
+	free(their_public_key_buf);
+	mpz_clears(sk, pk, their_pk, NULL);
+
+	// By this point, we set up the MAC using the session key generated to authenticate messages
+
+	unsigned char challenge_message[] = "Challenge: Authenticate me!";
+	unsigned char challenge_response[SHA256_DIGEST_LENGTH];
+
+	// Generate HMAC of the challenge using the session key (Also had to look this up)
+	HMAC_CTX *hmac_ctx = HMAC_CTX_new();
+	HMAC_Init_ex(hmac_ctx, local_session_key, sizeof(local_session_key), EVP_sha256(), NULL);
+	HMAC_Update(hmac_ctx, challenge_message, strlen(challenge_message));
+	HMAC_Final(hmac_ctx, challenge_response, NULL);
+	HMAC_CTX_free(hmac_ctx);
+
+	// Send the challenge response (HMAC) to the remote party
+	send(sockfd, challenge_response, sizeof(challenge_response), 0);
+
+	unsigned char received_challenge_response[SHA256_DIGEST_LENGTH];
+
+	// Receive challenge response from the remote party
+	if (recv(sockfd, received_challenge_response, sizeof(received_challenge_response), MSG_WAITALL) == -1) {
+    	perror("Failed to receive challenge response");
+    	exit(EXIT_FAILURE);
+	}
+
+	// Verify the challenge response using HMAC and session key
+	unsigned char expected_response[SHA256_DIGEST_LENGTH];
+	HMAC_CTX *hmac_ctx_verify = HMAC_CTX_new();
+	HMAC_Init_ex(hmac_ctx_verify, local_session_key, sizeof(local_session_key), EVP_sha256(), NULL);
+	HMAC_Update(hmac_ctx_verify, challenge_message, strlen(challenge_message));
+	HMAC_Final(hmac_ctx_verify, expected_response, NULL);
+	HMAC_CTX_free(hmac_ctx_verify);
+
+	// Compare the received response with the expected response
+	if (memcmp(received_challenge_response, expected_response, sizeof(expected_response)) == 0) {
+    	printf("Mutual authentication successful!\n");
+	} else {
+    	printf("Authentication failed.\n");
+	}
+
 	/* setup GTK... */
 	GtkBuilder* builder;
 	GObject* window;
@@ -289,12 +410,27 @@ void* recvMsg(void*)
 			 * side has disconnected. */
 			return 0;
 		}
-		char* m = malloc(maxlen+2);
-		memcpy(m,msg,nbytes);
-		if (m[nbytes-1] != '\n')
-			m[nbytes++] = '\n';
-		m[nbytes] = 0;
-		g_main_context_invoke(NULL,shownewmessage,(gpointer)m);
+
+		printf("Received Encrypted Message (Hex): ");
+        for (int i = 0; i < nbytes; i++) {
+            printf("%02x", (unsigned char)msg[i]);
+        }
+        printf("\n");
+
+		// Extract the IV from the first AES_IVLEN bytes of the received message
+        unsigned char iv[AES_IVLEN];
+        memcpy(iv, msg, AES_IVLEN);
+
+        // Decrypt the ciphertext part of the message
+        unsigned char decrypted_msg[1024];
+        int decrypted_len = decrypt_message(msg + AES_IVLEN, nbytes - AES_IVLEN, session_key, iv, decrypted_msg);
+
+        // Null-terminate the decrypted message
+        decrypted_msg[decrypted_len] = '\0';
+
+        // Show the decrypted message in the GTK interface
+        char* m = strdup((char*)decrypted_msg);
+        g_main_context_invoke(NULL, shownewmessage, (gpointer)m);
 	}
 	return 0;
 }
